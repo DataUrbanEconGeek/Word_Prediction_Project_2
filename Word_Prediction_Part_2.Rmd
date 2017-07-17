@@ -1,0 +1,313 @@
+---
+title: 'NLP Project: Word Prediction Part 2'
+author: "Andrew Rosa"
+date: "4/19/2016"
+output:
+        html_document:
+                includes:
+                        in_header: head.html
+                css: style.css
+---
+
+## Background
+
+In Part 1 of this project we explored the data from three scourses containing text to see the frequency of words. We then randomized them and combined them into one set the we extracted a sample from. In the part we will quickly review the process of creating dataframes with the frequecies of words, and word sequnces. We'll create a predictive model, then we'll create an application to interect with. 
+
+#### Load Data Set
+
+```{r cache=TRUE}
+
+master_sample <- readLines("~/Desktop/Word_Prediction_Project_2/master_sample.txt")
+
+```
+
+```{r cache=TRUE, cache.lazy=FALSE, warning=FALSE, message=FALSE}
+library(tm)
+library(slam)
+library(stringr)
+
+cleanUp <- function(x){
+        Sample_Source <- VectorSource(x)
+        Sample_Corpus <- VCorpus(Sample_Source)
+        sample_clean <- tm_map(
+                sample_corpus, 
+                content_transformer(
+                        function(x) 
+                                gsub(x, pattern = "[^[:print:]]", replacement = "")
+                        )
+                )
+        Sample_Clean <- tm_map(Sample_Corpus, content_transformer(tolower))
+        Sample_Clean <- tm_map(Sample_Clean, removePunctuation)
+        Sample_Clean <- tm_map(Sample_Clean, stripWhitespace)
+        return(Sample_Clean)
+}
+
+master_cleaned <- cleanUp(master_sample)
+```
+
+```{r cache=TRUE, cache.lazy=FALSE}
+library(RWeka)
+options(mc.cores = 1)
+
+frequency_data_frame <-function(vcorpus, tokens = 1){
+        tokenizer <- function(y) 
+                unlist(lapply(ngrams(words(y), tokens), paste, collapse = " "), 
+                       use.names = FALSE)
+        tdm <- TermDocumentMatrix(vcorpus, 
+                                control = list(tokenize = tokenizer))
+        matri <- as.matrix(tdm)
+        freq <- rowSums(matri)
+        if(tokens == 1){
+                n_gram_df <- data.frame(last_term = names(freq),
+                                        frequency = freq)
+        } else {
+                first_terms <- c()
+                last_term <- c()
+                for(i in 1:length(freq)){
+                        split_terms <- unlist(str_split(names(freq)[i], " "))
+                        to <- length(split_terms) - 1
+                        temp_terms <- split_terms[1:to]
+                        temp_collapse <- paste(temp_terms, collapse = " ")
+                        first_terms <- c(first_terms, temp_collapse)
+                        last_term <- c(last_term, split_terms[tokens])
+                }
+                n_gram_df <- data.frame(first_terms,
+                                    last_term,
+                                    frequency = freq)
+        }
+        rownames(n_gram_df) <- NULL
+        return(n_gram_df)
+}
+
+unigram_df <- frequency_data_frame(master_cleaned, tokens = 1)
+bigram_df <- frequency_data_frame(master_cleaned, tokens = 2)
+trigram_df <- frequency_data_frame(master_cleaned, tokens = 3)
+
+remove_last_term_dgt <- function(x){
+        terms_w_digits <- grepl("\\d", x$last_term)
+        new_df <- x[!terms_w_digits]
+        return(new_df)
+}
+
+remove_first_term_dgt <- function(x){
+        terms_w_digits <- grepl("\\d", x$first_terms)
+        new_df <- x[!terms_w_digits]
+        return(new_df)
+}
+
+unigram_df <- remove_last_term_dgt(unigram_df)
+bigram_df <- remove_last_term_dgt(bigram_df)
+trigram_df <- remove_last_term_dgt(trigram_df)
+
+bigram_df <- remove_first_term_dgt(bigram_df)
+trigram_df <- remove_first_term_dgt(trigram_df)
+```
+
+```{r cache=TRUE}
+library(data.table)
+library(dplyr)
+
+discount_extend <- function(x){
+        setDT(x)
+        x$discount = rep(1, nrow(x))
+        for(i in 5:1){
+            current_r_times = i
+            next_r_times = current_r_times + 1
+            current_n = nrow(x[frequency == current_r_times])
+            next_n = nrow(x[frequency == next_r_times])
+            current_discount = (next_r_times / current_r_times) * (next_n / current_n) 
+            x[frequency == current_r_times, discount := current_discount]
+        }
+        return(x)
+}
+
+unigram_df <- discount_extend(unigram_df)
+bigram_df <- discount_extend(bigram_df)
+trigram_df <- discount_extend(trigram_df)
+
+left_over_probs = function(last_term, frequency, discount){
+    all_freq = sum(frequency)
+    return(1-sum((discount*frequency)/all_freq))
+}
+
+trigram_lop <- trigram_df[, .(leftoverprob = left_over_probs(last_term, 
+                                                            frequency, 
+                                                            discount)),
+                          by=first_terms]
+
+bigram_lop <- bigram_df[, .(leftoverprob = left_over_probs(last_term, 
+                                                            frequency, 
+                                                            discount)),
+                          by=first_terms]
+
+```
+
+```{r cache=TRUE}
+list_of_probs <- c()
+for(i in 1:nrow(trigram_df)){
+        subset_obs <- trigram_df[i, ]
+        subset_group_data <- trigram_df[first_terms == subset_obs$first_terms]
+        n_freq <- sum(subset_group_data$frequency)
+        prob <- ((subset_obs$discount * subset_obs$frequency) / n_freq)
+        list_of_probs <- c(list_of_probs, prob)
+}
+
+trigram_df$probs <- list_of_probs
+    
+list_of_probs2 <- c()
+for(i in 1:nrow(bigram_df)){
+        subset_obs <- bigram_df[i, ]
+        subset_group_data <- bigram_df[first_terms == subset_obs$first_terms]
+        n_freq <- sum(subset_group_data$frequency)
+        prob <- ((subset_obs$discount * subset_obs$frequency) / n_freq)
+        list_of_probs2 <- c(list_of_probs2, prob)
+}
+        
+bigram_df$probs <- list_of_probs2
+
+list_of_probs3 <- c()
+for(i in 1:nrow(unigram_df)){
+        subset_obs <- unigram_df[i, ]
+        n_freq <- sum(unigram_df$frequency)
+        prob <- (subset_obs$discount * subset_obs$frequency) / n_freq
+        list_of_probs3 <- c(list_of_probs3, prob)
+}
+
+unigram_df$probs <- list_of_probs3
+
+```
+
+```{r cache=TRUE}
+save(trigram_lop, bigram_lop, trigram_df, bigram_df, unigram_df, file = "training_data.RData")
+```
+
+```{r cache=TRUE}
+x <- "it"
+
+prediction <- function(x){
+        text_split <- unlist(strsplit(x, split = " "))
+        if(length(text_split) == 1){
+                group_predictors <- bigram_df[first_terms == text_split]
+                if(nrow(group_predictors) > 0){
+                        sort <- group_predictors[order(probs, decreasing = TRUE)]
+                        if(nrow(sort) >= 50){
+                                top_prob <- sort[1:50, ]
+                                term_and_prob <- data.frame(word = top_prob$last_term, 
+                                                            probability = top_prob$probs)
+                        } else {
+                                top_prob <- sort[1:nrow(sort), ]
+                                temp_df <- data.frame(word = top_prob$last_term, 
+                                                        probability = top_prob$probs)
+                                uni_temp <- unigram_df[!(unigram_df$last_term %in%
+                                                                top_prob$last_term)]
+                                beta_lop <- bigram_lop[first_terms == text_split]$leftoverprob
+                                n_freq <- sum(unigram_df$frequency)
+                                alpha <- beta_lop / sum((uni_temp$frequency * uni_temp$discount)
+                                                        / n_freq)
+                                top_prob2 <- mutate(uni_temp, final_proba = alpha * probs)
+                                temp_df2 <- data.frame(word = top_prob2$last_term, 
+                                                       probability = top_prob2$probs)
+                                term_and_prob <- rbind(temp_df, temp_df2)
+                                term_and_prob <- term_and_prob[1:50, ]
+                        }
+                } else {
+                        sort <- unigram_df[order(probs, decreasing = TRUE)]
+                        top_prob <- sort[1:50, ]
+                        term_and_prob <- data.frame(word = top_prob$last_term, probability =
+                                                        top_prob$probs)
+                }
+        } else {
+                last_2 <- tail(text_split, 2)
+                gram_recon <- paste(last_2[-2], last_2[-1], sep = " ")
+                group_predictors <- trigram_df[first_terms == gram_recon]
+                if(nrow(group_predictors) > 0){
+                        sort <- group_predictors[order(probs, decreasing = TRUE)]
+                        if(nrow(sort) >= 50){
+                                top_prob <- sort[1:50, ]
+                                term_and_prob <- data.frame(word = top_prob$last_term,
+                                                        probability = top_prob$probs)
+                        } else {
+                                top_prob <- sort[1:nrow(sort), ]
+                                temp_df <- data.frame(word = top_prob$last_term, 
+                                                        probability = top_prob$probs)
+                                beta_lop <- trigram_lop[first_terms == gram_recon]$leftoverprob
+                                subset_group <- bigram_df[first_terms == last[2]]
+                                n_freq <- sum(subset_group$frequency)
+                                bi_temp <- subset_group[!(subset_group$last_term %in%
+                                                                top_prob$last_term)]
+                                alpha <- beta_lop / sum((bi_temp$frequency * bi_temp$discount)
+                                                        / n_freq)
+                                top_prob2 <- mutate(bi_temp, final_proba = alpha * probs)
+                                temp_df2 <- data.frame(word = top_prob2$last_term, 
+                                                       probability = top_prob2$probs)
+                                temp_df3 <- rbind(temp_df, temp_df2)
+                                if(nrow(temp_df3) >= 50){
+                                        term_and_prob <- temp_df3[1:50, ]
+                                } else {
+                                        n_freq <- sum(unigram_df$frequency)
+                                        uni_temp <- unigram_df[!(unigram_df$last_term %in%
+                                                                temp_df3$word)]
+                                        alpha <- beta_lop / sum((uni_temp$frequency * 
+                                                                        uni_temp$discount) / 
+                                                                        n_freq)
+                                        top_prob3 <- mutate(uni_temp, final_proba = 
+                                                                alpha * probs)
+                                        temp_df4 <- data.frame(word = top_prob3$last_term, 
+                                                       probability = top_prob3$probs)
+                                        temp_df5 <- rbind(temp_df3, temp_df4)
+                                        term_and_prob <- temp_df5[1:50, ]
+                                }
+                        }
+                } else {
+                        last <- last_2[2]
+                        group_predictors2 <- bigram_df[first_terms == last]
+                        if(nrow(group_predictors2) > 0){
+                                sort <- group_predictors2[order(probs, decreasing = TRUE)]
+                                if(nrow(sort) >= 50){
+                                        top_prob <- sort[1:50, ]
+                                        term_and_prob <- data.frame(word = top_prob$last_term,
+                                                        probability = top_prob$probs)
+                                } else {
+                                        top_prob <- sort[1:nrow(sort), ]
+                                        temp_df <- data.frame(word = top_prob$last_term, 
+                                                        probability = top_prob$probs)
+                                        uni_temp <- unigram_df[!(unigram_df$last_term %in%
+                                                                top_prob$last_term)]
+                                        beta_lop <- bigram_lop[first_terms == 
+                                                                       last]$leftoverprob
+                                        n_freq <- sum(unigram_df$frequency)
+                                        alpha <- beta_lop / sum((uni_temp$frequency * 
+                                                                         uni_temp$discount)
+                                                                / n_freq)
+                                        top_prob2 <- mutate(uni_temp, final_proba = alpha * 
+                                                                    probs)
+                                        temp_df2 <- data.frame(word = top_prob2$last_term, 
+                                                       probability = top_prob2$probs)
+                                        term_and_prob <- rbind(temp_df, temp_df2)
+                                        term_and_prob <- term_and_prob[1:50, ]
+                                }
+                        } else {
+                                sort <- unigram_df[order(probs, decreasing = TRUE)]
+                                top_prob <- sort[1:50, ]
+                                term_and_prob <- data.frame(word = top_prob$last_term,
+                                                            probability = top_prob$probs)
+                        }
+                }
+        }
+        return(term_and_prob)
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
